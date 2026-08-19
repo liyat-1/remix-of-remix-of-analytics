@@ -2,12 +2,16 @@
  * OTA Analytics — the reporting model behind the OTA Buster analytics page.
  *
  * Two distinct concepts, never conflated:
- *   CAPTURED  — guest contact data obtained from OTA guests (unmasked email,
- *               phone, address). Masked OTA emails are NOT captured emails.
- *   CONVERTED — OTA guests that became direct guests, and the revenue impact.
  *
- * Every number is derived from one authoritative base set, scaled by period,
- * so the page can never contradict itself.
+ *   CAPTURED  — guest records captured FROM the OTA. Everything here is still
+ *               masked: masked OTA emails, masked OTA phone numbers, masked
+ *               OTA addresses. Masked data is data we hold but cannot use.
+ *   CONVERTED — the masked data we turned into usable, hotel-owned contact
+ *               details, and the direct bookings and revenue that followed.
+ *
+ * Every number on the page is derived from ONE base set (`BASE`) scaled by
+ * period and — for the captured side — by the selected OTA engine, so the
+ * headline, the KPI cards and the detail cards can never disagree.
  */
 
 export type AnalyticsPeriod = "7d" | "15d" | "30d" | "90d" | "custom";
@@ -31,28 +35,43 @@ const FACTOR: Record<AnalyticsPeriod, number> = {
 const scale = (n: number, p: AnalyticsPeriod) => Math.round(n * FACTOR[p]);
 export const fmt = (n: number) => n.toLocaleString("en-US");
 export const money = (n: number) => `$${n.toLocaleString("en-US")}`;
+const pct1 = (n: number, of: number) => (of ? Math.round((n / of) * 1000) / 10 : 0);
 
 /* ------------------------------ base values ----------------------------- */
 
 const BASE = {
-  otaGuests: 12483,
+  /** Guest records captured from OTA booking engines (all masked). */
+  otaGuestsCaptured: 12483,
+
+  /** Masked values received from the OTA — held, but not usable. */
+  maskedEmails: 11240,
+  maskedPhones: 10380,
+  maskedAddresses: 9120,
+
+  /** Captured records that carry all three masked fields. */
+  completeProfiles: 8420,
+
+  /** Guests we were able to message at least once. */
   reached: 8240,
-  engaged: 3131,
-  /** OTA guests with at least one usable (unmasked) contact detail. */
-  capturedGuests: 7615,
+  /** Guests where at least one masked value became a usable, owned value. */
+  convertedGuests: 3820,
+
+  /** Masked → usable conversions, by field. */
+  usableEmails: 3410,
+  usablePhones: 2760,
+  usableAddresses: 1980,
+
+  /** Direct business that followed. */
   conversions: 642,
   revenue: 84200,
   commission: 14310,
   repeat: 214,
-  emails: 6420,
-  phones: 5180,
-  addresses: 3940,
-  /** Masked relay addresses supplied by the OTA — not usable, not captured. */
-  maskedEmails: 4310,
-  /** OTA guests with no usable email and none captured yet. */
-  missingEmail: 1753,
-  /** Guests with the required contact set (email + phone). */
-  completeProfiles: 4860,
+
+  /** Not-converted breakdown. Sums to reached − convertedGuests. */
+  noEngagement: 2380,
+  engagedNoInfo: 1177,
+  windowExpired: 610,
+  accessUnavailable: 253,
 };
 
 /** OTA → Direct lift attributable to the journey. */
@@ -68,316 +87,421 @@ export type Kpi = {
   metric?: SeriesMetric;
 };
 
-const captureRate = () => (BASE.capturedGuests / BASE.otaGuests) * 100;
-const completenessRate = () => (BASE.completeProfiles / BASE.capturedGuests) * 100;
-const conversionRate = () => (BASE.conversions / BASE.reached) * 100;
+/* ------------------------------ OTA engines ----------------------------- */
 
-/* ------------------------- section 1 — captured ------------------------- */
+export type EngineId = "all" | "booking" | "expedia" | "airbnb" | "agoda" | "hotels" | "other";
 
-export function captureKpis(period: AnalyticsPeriod): Kpi[] {
-  const otaGuests = scale(BASE.otaGuests, period);
-  const reached = scale(BASE.reached, period);
+type EngineProfile = {
+  value: EngineId;
+  label: string;
+  /** Share of total captured OTA records. Real engines sum to 1. */
+  share: number;
+  /** Multiplier on masked values relayed by this engine. */
+  maskedBias: number;
+  /** Multiplier on complete (all-three-fields) profiles. */
+  completeBias: number;
+};
+
+const ENGINE_PROFILES: EngineProfile[] = [
+  { value: "booking", label: "Booking.com", share: 0.38, maskedBias: 1.04, completeBias: 1.06 },
+  { value: "expedia", label: "Expedia", share: 0.22, maskedBias: 1.02, completeBias: 1.12 },
+  { value: "airbnb", label: "Airbnb", share: 0.14, maskedBias: 1.06, completeBias: 0.71 },
+  { value: "agoda", label: "Agoda", share: 0.11, maskedBias: 0.98, completeBias: 0.88 },
+  { value: "hotels", label: "Hotels.com", share: 0.09, maskedBias: 1.0, completeBias: 1.02 },
+  { value: "other", label: "Other engines", share: 0.06, maskedBias: 0.94, completeBias: 0.9 },
+];
+
+export const OTA_ENGINES: { value: EngineId; label: string }[] = [
+  { value: "all", label: "All OTA engines" },
+  ...ENGINE_PROFILES.map((e) => ({ value: e.value, label: e.label })),
+];
+
+export const engineLabel = (id: EngineId) =>
+  OTA_ENGINES.find((e) => e.value === id)?.label ?? "All OTA engines";
+
+const ALL_ENGINES: EngineProfile = {
+  value: "all",
+  label: "All OTA engines",
+  share: 1,
+  maskedBias: 1,
+  completeBias: 1,
+};
+
+const engineProfile = (id: EngineId) =>
+  id === "all" ? ALL_ENGINES : (ENGINE_PROFILES.find((e) => e.value === id) ?? ALL_ENGINES);
+
+/* ------------------------ THE captured model (one source) ---------------- */
+
+export type MaskedField = {
+  key: "email" | "phone" | "address";
+  /** "Masked OTA emails" etc. */
+  label: string;
+  hint: string;
+  count: number;
+  /** Share of captured OTA records that carry this masked field. */
+  pct: number;
+  /** Records with no value at all for this field. */
+  absent: number;
+};
+
+export type CapturedModel = {
+  /** OTA guests captured — the denominator for everything in Captured. */
+  otaGuestsCaptured: number;
+  masked: MaskedField[];
+  completeProfiles: number;
+  incompleteProfiles: number;
+  /** Single completeness percentage used by the headline AND the KPI card. */
+  completenessPct: number;
+  /** Why profiles are incomplete — overlapping absent-field counts. */
+  gaps: { key: string; label: string; count: number; pct: number }[];
+};
+
+export function capturedModel(period: AnalyticsPeriod, engine: EngineId): CapturedModel {
+  const e = engineProfile(engine);
+  const total = Math.round(scale(BASE.otaGuestsCaptured, period) * e.share);
+
+  const maskedCount = (n: number) =>
+    Math.min(total, Math.round(scale(n, period) * e.share * e.maskedBias));
+
+  const defs: { key: MaskedField["key"]; label: string; hint: string; n: number }[] = [
+    {
+      key: "email",
+      label: "Masked OTA emails",
+      hint: "Relay addresses supplied by the booking engine.",
+      n: BASE.maskedEmails,
+    },
+    {
+      key: "phone",
+      label: "Masked OTA phone numbers",
+      hint: "Proxy numbers that stop routing after the stay.",
+      n: BASE.maskedPhones,
+    },
+    {
+      key: "address",
+      label: "Masked OTA addresses",
+      hint: "Partial or redacted postal addresses.",
+      n: BASE.maskedAddresses,
+    },
+  ];
+
+  const masked: MaskedField[] = defs.map((d) => {
+    const count = maskedCount(d.n);
+    return {
+      key: d.key,
+      label: d.label,
+      hint: d.hint,
+      count,
+      pct: pct1(count, total),
+      absent: Math.max(0, total - count),
+    };
+  });
+
+  const minMasked = Math.min(...masked.map((m) => m.count));
+  const completeProfiles = Math.min(
+    minMasked,
+    Math.round(scale(BASE.completeProfiles, period) * e.share * e.completeBias),
+  );
+  const incompleteProfiles = Math.max(0, total - completeProfiles);
+
+  return {
+    otaGuestsCaptured: total,
+    masked,
+    completeProfiles,
+    incompleteProfiles,
+    completenessPct: pct1(completeProfiles, total),
+    gaps: masked.map((m) => ({
+      key: m.key,
+      label:
+        m.key === "email"
+          ? "No email of any kind"
+          : m.key === "phone"
+            ? "No phone number of any kind"
+            : "No address of any kind",
+      count: m.absent,
+      pct: pct1(m.absent, incompleteProfiles),
+    })),
+  };
+}
+
+/* ------------------------- section 1 — captured KPIs --------------------- */
+
+export function captureKpisFor(period: AnalyticsPeriod, engine: EngineId): Kpi[] {
+  const m = capturedModel(period, engine);
+  const [email, phone, address] = m.masked;
 
   return [
     {
       key: "ota",
-      label: "OTA guests",
-      value: fmt(otaGuests),
+      label: "OTA guests captured",
+      value: fmt(m.otaGuestsCaptured),
       delta: 4.1,
-      meta: "Total OTA guests entering the journey.",
-      metric: "ota",
+      meta: "Guest records captured from OTA booking engines.",
+      metric: "otaCaptured",
     },
     {
-      key: "reached",
-      label: "Guests reached",
-      value: fmt(reached),
-      delta: 6.2,
-      meta: "OTA guests reached through the OTA Buster journey.",
-      metric: "reached",
-    },
-    {
-      key: "email",
-      label: "Email captured",
-      value: fmt(scale(BASE.emails, period)),
-      delta: 8.4,
-      meta: "Unmasked email addresses captured from OTA guests.",
-      metric: "email",
-    },
-    {
-      key: "phone",
-      label: "Phone numbers captured",
-      value: fmt(scale(BASE.phones, period)),
-      delta: 6.1,
-      meta: "Unmasked phone numbers captured from OTA guests.",
-      metric: "phone",
-    },
-    {
-      key: "address",
-      label: "Addresses captured",
-      value: fmt(scale(BASE.addresses, period)),
-      delta: 4.2,
-      meta: "Guest addresses captured during the journey.",
-      metric: "address",
-    },
-    {
-      key: "masked",
+      key: "maskedEmail",
       label: "Masked OTA emails",
-      value: fmt(scale(BASE.maskedEmails, period)),
-      delta: -3.4,
-      meta: "Masked email addresses received from OTA booking engines.",
-      metric: "masked",
+      value: fmt(email?.count ?? 0),
+      delta: 5.6,
+      meta: `${email?.pct ?? 0}% of captured records carry a relay address.`,
+      metric: "maskedEmail",
     },
     {
-      key: "missing",
-      label: "Missing email",
-      value: fmt(scale(BASE.missingEmail, period)),
-      delta: -7.9,
-      meta: "OTA guests without an available email address.",
-      metric: "missing",
+      key: "maskedPhone",
+      label: "Masked OTA phone numbers",
+      value: fmt(phone?.count ?? 0),
+      delta: 4.3,
+      meta: `${phone?.pct ?? 0}% carry a proxy phone number.`,
+      metric: "maskedPhone",
     },
     {
-      key: "captureRate",
-      label: "Capture rate",
-      value: `${captureRate().toFixed(1)}%`,
-      delta: 5.3,
-      meta: "Share of OTA guests with usable guest data captured.",
-      metric: "captureRate",
+      key: "maskedAddress",
+      label: "Masked OTA addresses",
+      value: fmt(address?.count ?? 0),
+      delta: 3.1,
+      meta: `${address?.pct ?? 0}% carry a partial postal address.`,
+      metric: "maskedAddress",
     },
     {
       key: "profiles",
       label: "Complete profiles",
-      value: fmt(scale(BASE.completeProfiles, period)),
+      value: fmt(m.completeProfiles),
       delta: 9.1,
-      meta: `Required contact information available · ${completenessRate().toFixed(0)}% completeness`,
+      meta: `All three masked fields present · ${m.completenessPct}% of captured records.`,
+      metric: "completeProfiles",
+    },
+    {
+      key: "completeness",
+      label: "Profile completeness",
+      value: `${m.completenessPct}%`,
+      delta: 3.8,
+      meta: `${fmt(m.completeProfiles)} of ${fmt(m.otaGuestsCaptured)} captured records.`,
+      metric: "completenessRate",
     },
   ];
 }
 
-/* ------------------------ section 2 — converted ------------------------- */
+/* ------------------------ section 2 — converted KPIs -------------------- */
+
+export type ConvertedModel = {
+  reached: number;
+  convertedGuests: number;
+  /** convertedGuests / reached */
+  convertRate: number;
+  notConverted: number;
+  fields: {
+    key: "email" | "phone" | "address";
+    masked: number;
+    usable: number;
+    rate: number;
+    label: string;
+    hint: string;
+  }[];
+  conversions: number;
+  conversionRate: number;
+  revenue: number;
+  revenuePer: number;
+  commission: number;
+  repeat: number;
+  lift: number;
+  /** Direct bookings / converted guests */
+  bookingRate: number;
+  outcomes: OutcomeRow[];
+};
+
+export function convertedModel(period: AnalyticsPeriod): ConvertedModel {
+  const s = (n: number) => scale(n, period);
+  const captured = capturedModel(period, "all");
+  const reached = s(BASE.reached);
+  const convertedGuests = s(BASE.convertedGuests);
+  const conversions = s(BASE.conversions);
+  const revenue = s(BASE.revenue);
+  const notConverted = Math.max(0, reached - convertedGuests);
+
+  const fieldDefs = [
+    {
+      key: "email" as const,
+      label: "Email",
+      hint: "Masked relay address → real inbox we own.",
+      usable: s(BASE.usableEmails),
+    },
+    {
+      key: "phone" as const,
+      label: "Phone number",
+      hint: "Proxy number → real mobile we can text.",
+      usable: s(BASE.usablePhones),
+    },
+    {
+      key: "address" as const,
+      label: "Address",
+      hint: "Partial address → full postal address.",
+      usable: s(BASE.usableAddresses),
+    },
+  ];
+
+  const fields = fieldDefs.map((f) => {
+    const masked = captured.masked.find((m) => m.key === f.key)?.count ?? 0;
+    return {
+      key: f.key,
+      label: f.label,
+      hint: f.hint,
+      masked,
+      usable: f.usable,
+      rate: pct1(f.usable, masked),
+    };
+  });
+
+  const outcomes: OutcomeRow[] = [
+    {
+      key: "noEngage",
+      group: "campaign",
+      label: "Never engaged",
+      hint: "Messages delivered, no interaction at all.",
+      count: s(BASE.noEngagement),
+      pct: pct1(s(BASE.noEngagement), notConverted),
+    },
+    {
+      key: "noInfo",
+      group: "campaign",
+      label: "Engaged, gave no details",
+      hint: "Opened or clicked, but never handed over a usable value.",
+      count: s(BASE.engagedNoInfo),
+      pct: pct1(s(BASE.engagedNoInfo), notConverted),
+    },
+    {
+      key: "expired",
+      group: "data",
+      label: "OTA data window expired",
+      hint: "The permitted access period ran out before we could reach them.",
+      count: s(BASE.windowExpired),
+      pct: pct1(s(BASE.windowExpired), notConverted),
+    },
+    {
+      key: "revoked",
+      group: "data",
+      label: "OTA access unavailable",
+      hint: "The booking engine withdrew or restricted access.",
+      count: s(BASE.accessUnavailable),
+      pct: pct1(s(BASE.accessUnavailable), notConverted),
+    },
+  ];
+
+  return {
+    reached,
+    convertedGuests,
+    convertRate: pct1(convertedGuests, reached),
+    notConverted,
+    fields,
+    conversions,
+    conversionRate: pct1(conversions, reached),
+    revenue,
+    revenuePer: conversions ? Math.round(revenue / conversions) : 0,
+    commission: s(BASE.commission),
+    repeat: s(BASE.repeat),
+    lift: LIFT,
+    bookingRate: pct1(conversions, convertedGuests),
+    outcomes,
+  };
+}
 
 export function conversionKpis(period: AnalyticsPeriod): Kpi[] {
-  const conversions = scale(BASE.conversions, period);
-  const revenue = scale(BASE.revenue, period);
-  const avg = conversions ? Math.round(revenue / conversions) : 0;
+  const c = convertedModel(period);
 
   return [
     {
+      key: "reached",
+      label: "Guests reached",
+      value: fmt(c.reached),
+      delta: 6.2,
+      meta: "Captured OTA guests we messaged at least once.",
+      metric: "reached",
+    },
+    {
+      key: "convertedGuests",
+      label: "Guests converted",
+      value: fmt(c.convertedGuests),
+      delta: 14.3,
+      meta: `Masked → usable contact details · ${c.convertRate}% of reached.`,
+      metric: "convertedGuests",
+    },
+    {
       key: "conversions",
-      label: "Direct conversions",
-      value: fmt(conversions),
+      label: "Direct bookings",
+      value: fmt(c.conversions),
       delta: 18.2,
-      meta: "OTA guests converted to direct guests.",
+      meta: `${c.bookingRate}% of converted guests booked direct.`,
       metric: "conversions",
     },
     {
       key: "revenue",
       label: "Direct revenue",
-      value: money(revenue),
+      value: money(c.revenue),
       delta: 18.2,
-      meta: `Revenue attributed to converted OTA guests · ${money(avg)} per conversion`,
+      meta: `${money(c.revenuePer)} per direct booking.`,
       metric: "revenue",
     },
     {
       key: "commission",
       label: "Commission avoided",
-      value: money(scale(BASE.commission, period)),
+      value: money(c.commission),
       delta: 16.8,
-      meta: "Estimated OTA commission avoided through direct conversion.",
+      meta: "Estimated OTA commission avoided by going direct.",
       metric: "commission",
     },
     {
       key: "conversionRate",
-      label: "Conversion rate",
-      value: `${conversionRate().toFixed(1)}%`,
+      label: "Booking conversion rate",
+      value: `${c.conversionRate}%`,
       delta: 11.4,
-      meta: "Reached OTA guests converted to direct.",
+      meta: "Reached OTA guests that produced a direct booking.",
       metric: "conversionRate",
     },
     {
       key: "repeat",
       label: "Repeat direct guests",
-      value: fmt(scale(BASE.repeat, period)),
+      value: fmt(c.repeat),
       delta: 15.7,
-      meta: "Converted guests who later returned as direct guests.",
+      meta: "Converted guests who came back direct again.",
       metric: "repeat",
     },
     {
       key: "lift",
       label: "OTA → Direct lift",
-      value: `${LIFT.toFixed(1)}%`,
+      value: `${c.lift.toFixed(1)}%`,
       delta: 6.9,
       meta: "Change in direct booking behaviour attributable to the journey.",
     },
   ];
 }
 
-/* --------------------------- data completeness -------------------------- */
-
-export type CompletenessRow = { key: string; label: string; value: string; percent: number };
-
-export function completeness(period: AnalyticsPeriod): CompletenessRow[] {
-  const base = BASE.capturedGuests;
-  const rows = [
-    { key: "email", label: "Email", n: BASE.emails },
-    { key: "phone", label: "Phone", n: BASE.phones },
-    { key: "address", label: "Address", n: BASE.addresses },
-    { key: "profile", label: "Complete profile", n: BASE.completeProfiles },
-  ];
-  return rows.map((r) => ({
-    key: r.key,
-    label: r.label,
-    value: fmt(scale(r.n, period)),
-    percent: Math.round((r.n / base) * 100),
-  }));
-}
-
-/* ------------------------ capture by journey stage ---------------------- */
-
-export type CaptureStageRow = {
-  stage: string;
-  reached: string;
-  emails: string;
-  phones: string;
-  addresses: string;
-  masked: string;
-  missing: string;
-  rate: string;
-};
-
-const STAGES = [
-  {
-    stage: "Just Booked",
-    reached: 8240,
-    emails: 2420,
-    phones: 1920,
-    addresses: 1140,
-    masked: 1640,
-    missing: 740,
-    rate: 41,
-    momentum: 8.4,
-    engagement: "14.5%",
-    conversions: 0,
-    revenue: 0,
-  },
-  {
-    stage: "Pre-Check-In",
-    reached: 6480,
-    emails: 1920,
-    phones: 1420,
-    addresses: 840,
-    masked: 1080,
-    missing: 460,
-    rate: 44,
-    momentum: 6.1,
-    engagement: "15.8%",
-    conversions: 0,
-    revenue: 0,
-  },
-  {
-    stage: "During Stay",
-    reached: 6120,
-    emails: 2840,
-    phones: 2160,
-    addresses: 1280,
-    masked: 820,
-    missing: 310,
-    rate: 58,
-    momentum: 9.3,
-    engagement: "14.2%",
-    conversions: 0,
-    revenue: 0,
-  },
-  {
-    stage: "Post-Checkout",
-    reached: 5940,
-    emails: 1740,
-    phones: 1420,
-    addresses: 980,
-    masked: 540,
-    missing: 180,
-    rate: 47,
-    momentum: 7.6,
-    engagement: "13.9%",
-    conversions: 380,
-    revenue: 49800,
-  },
-  {
-    stage: "Winback / Retain",
-    reached: 4210,
-    emails: 1220,
-    phones: 940,
-    addresses: 640,
-    masked: 230,
-    missing: 63,
-    rate: 39,
-    momentum: 5.2,
-    engagement: "12.8%",
-    conversions: 262,
-    revenue: 34400,
-  },
-];
-
-export function captureStageRows(period: AnalyticsPeriod): CaptureStageRow[] {
-  return STAGES.map((r) => ({
-    stage: r.stage,
-    reached: fmt(scale(r.reached, period)),
-    emails: fmt(scale(r.emails, period)),
-    phones: fmt(scale(r.phones, period)),
-    addresses: fmt(scale(r.addresses, period)),
-    masked: fmt(scale(r.masked, period)),
-    missing: fmt(scale(r.missing, period)),
-    rate: `${r.rate}%`,
-  }));
-}
-
-/* --------------------- conversion by journey stage ---------------------- */
-
-export type StageRow = {
-  stage: string;
-  reached: string;
-  momentum: number;
-  engagement: string;
-  conversions: string;
-  conversionRate: string;
-  revenue: string;
-};
-
-export function stageRows(period: AnalyticsPeriod): StageRow[] {
-  return STAGES.map((r) => ({
-    stage: r.stage,
-    reached: fmt(scale(r.reached, period)),
-    momentum: r.momentum,
-    engagement: r.engagement,
-    conversions: r.conversions ? fmt(scale(r.conversions, period)) : "—",
-    conversionRate: r.conversions ? `${((r.conversions / r.reached) * 100).toFixed(1)}%` : "—",
-    revenue: r.revenue ? money(scale(r.revenue, period)) : "—",
-  }));
-}
-
-/* --------------------------- channel performance ------------------------ */
+/* --------------------- merged channel + strategy table ------------------ */
 
 export type ChannelRow = {
   key: string;
   channel: string;
   hint: string;
-  sent: string;
+  reached: string;
   delivered: string;
   deliveryRate: string;
   ctr: string;
   response: string;
   conversions: string;
   conversionRate: string;
+  conversionRateValue: number;
   revenue: string;
+  revenuePer: string;
+  /** Share of total direct revenue, for the in-table bar. */
+  revenueShare: number;
 };
 
 const CHANNELS = [
   {
     key: "email",
-    channel: "Email",
-    hint: "Email only",
+    channel: "Email only",
+    hint: "One email track, no SMS",
     reached: 3860,
-    sent: 824,
-    delivered: 792,
+    sent: 4120,
+    delivered: 3960,
     ctr: "36%",
     response: "12%",
     conversions: 412,
@@ -385,11 +509,11 @@ const CHANNELS = [
   },
   {
     key: "text",
-    channel: "Text",
-    hint: "SMS only",
+    channel: "Text only",
+    hint: "SMS track, no email",
     reached: 1640,
-    sent: 460,
-    delivered: 449,
+    sent: 1720,
+    delivered: 1682,
     ctr: "29%",
     response: "18%",
     conversions: 142,
@@ -397,11 +521,11 @@ const CHANNELS = [
   },
   {
     key: "text_fallback",
-    channel: "Text with Email fallback",
+    channel: "Text with email fallback",
     hint: "Text first, email when the text can't be sent",
     reached: 1490,
-    sent: 388,
-    delivered: 381,
+    sent: 1554,
+    delivered: 1521,
     ctr: "33%",
     response: "19%",
     conversions: 96,
@@ -412,8 +536,8 @@ const CHANNELS = [
     channel: "Email + Text",
     hint: "Both channels, separate content",
     reached: 1250,
-    sent: null as number | null,
-    delivered: null as number | null,
+    sent: 2380,
+    delivered: 2298,
     ctr: "41%",
     response: "22%",
     conversions: 88,
@@ -422,60 +546,76 @@ const CHANNELS = [
 ];
 
 export function channelRows(period: AnalyticsPeriod): ChannelRow[] {
-  return CHANNELS.map((c) => ({
-    key: c.key,
-    channel: c.channel,
-    hint: c.hint,
-    sent: c.sent === null ? "—" : fmt(scale(c.sent, period)),
-    delivered: c.delivered === null ? "—" : fmt(scale(c.delivered, period)),
-    deliveryRate:
-      c.sent === null || c.delivered === null
-        ? "—"
-        : `${Math.round((c.delivered / c.sent) * 100)}%`,
-    ctr: c.ctr,
-    response: c.response,
-    conversions: fmt(scale(c.conversions, period)),
-    conversionRate: `${((c.conversions / c.reached) * 100).toFixed(1)}%`,
-    revenue: money(scale(c.revenue, period)),
-  }));
+  const totalRevenue = CHANNELS.reduce((a, c) => a + c.revenue, 0);
+  return CHANNELS.map((c) => {
+    const rate = pct1(c.conversions, c.reached);
+    return {
+      key: c.key,
+      channel: c.channel,
+      hint: c.hint,
+      reached: fmt(scale(c.reached, period)),
+      delivered: fmt(scale(c.delivered, period)),
+      deliveryRate: `${Math.round((c.delivered / c.sent) * 100)}%`,
+      ctr: c.ctr,
+      response: c.response,
+      conversions: fmt(scale(c.conversions, period)),
+      conversionRate: `${rate}%`,
+      conversionRateValue: rate,
+      revenue: money(scale(c.revenue, period)),
+      revenuePer: money(Math.round(c.revenue / c.conversions)),
+      revenueShare: Math.round((c.revenue / totalRevenue) * 100),
+    };
+  }).sort((a, b) => b.revenueShare - a.revenueShare);
 }
 
-/* --------------------------- strategy performance ----------------------- */
+/* ------------------------- capture by OTA engine ------------------------ */
 
-export type StrategyRow = {
-  key: string;
-  strategy: string;
-  reached: string;
-  conversions: string;
-  conversionRate: string;
-  revenue: string;
-  revenuePer: string;
+export type EngineRow = {
+  key: EngineId;
+  engine: string;
+  share: string;
+  otaGuests: string;
+  maskedEmail: string;
+  maskedPhone: string;
+  maskedAddress: string;
+  profiles: string;
+  completeness: string;
+  completenessValue: number;
 };
 
-export function strategyRows(period: AnalyticsPeriod): StrategyRow[] {
-  return CHANNELS.map((c) => ({
-    key: c.key,
-    strategy: c.channel,
-    reached: fmt(scale(c.reached, period)),
-    conversions: fmt(scale(c.conversions, period)),
-    conversionRate: `${((c.conversions / c.reached) * 100).toFixed(1)}%`,
-    revenue: money(scale(c.revenue, period)),
-    revenuePer: money(Math.round(c.revenue / c.conversions)),
-  }));
+export function engineRows(period: AnalyticsPeriod): EngineRow[] {
+  return ENGINE_PROFILES.map((e) => {
+    const m = capturedModel(period, e.value);
+    const find = (k: MaskedField["key"]) => m.masked.find((x) => x.key === k)?.count ?? 0;
+    return {
+      key: e.value,
+      engine: e.label,
+      share: `${Math.round(e.share * 100)}%`,
+      otaGuests: fmt(m.otaGuestsCaptured),
+      maskedEmail: fmt(find("email")),
+      maskedPhone: fmt(find("phone")),
+      maskedAddress: fmt(find("address")),
+      profiles: fmt(m.completeProfiles),
+      completeness: `${m.completenessPct}%`,
+      completenessValue: m.completenessPct,
+    };
+  }).sort((a, b) => b.completenessValue - a.completenessValue);
 }
 
 /* ------------------------------ time series ----------------------------- */
 
 export type SeriesMetric =
-  | "ota"
+  | "otaCaptured"
+  | "maskedEmail"
+  | "maskedPhone"
+  | "maskedAddress"
+  | "completeProfiles"
+  | "completenessRate"
   | "reached"
-  | "email"
-  | "phone"
-  | "address"
-  | "masked"
-  | "missing"
-  | "captureRate"
-  | "profiles"
+  | "convertedGuests"
+  | "usableEmail"
+  | "usablePhone"
+  | "usableAddress"
   | "conversions"
   | "revenue"
   | "commission"
@@ -483,19 +623,21 @@ export type SeriesMetric =
   | "repeat";
 
 export const SERIES_METRICS: { value: SeriesMetric; label: string }[] = [
-  { value: "ota", label: "OTA guests" },
+  { value: "otaCaptured", label: "OTA guests captured" },
+  { value: "maskedEmail", label: "Masked OTA emails" },
+  { value: "maskedPhone", label: "Masked OTA phone numbers" },
+  { value: "maskedAddress", label: "Masked OTA addresses" },
+  { value: "completeProfiles", label: "Complete profiles" },
+  { value: "completenessRate", label: "Profile completeness" },
   { value: "reached", label: "Guests reached" },
-  { value: "email", label: "Emails captured" },
-  { value: "phone", label: "Phone numbers captured" },
-  { value: "address", label: "Postal addresses captured" },
-  { value: "masked", label: "Masked OTA emails" },
-  { value: "missing", label: "No email at all" },
-  { value: "captureRate", label: "Capture rate" },
-  { value: "profiles", label: "Complete profiles" },
-  { value: "conversions", label: "Direct conversions" },
+  { value: "convertedGuests", label: "Guests converted" },
+  { value: "usableEmail", label: "Emails converted to usable" },
+  { value: "usablePhone", label: "Phone numbers converted to usable" },
+  { value: "usableAddress", label: "Addresses converted to usable" },
+  { value: "conversions", label: "Direct bookings" },
   { value: "revenue", label: "Direct revenue" },
   { value: "commission", label: "Commission avoided" },
-  { value: "conversionRate", label: "Conversion rate" },
+  { value: "conversionRate", label: "Booking conversion rate" },
   { value: "repeat", label: "Repeat direct guests" },
 ];
 
@@ -505,15 +647,17 @@ export const seriesLabel = (m: SeriesMetric) =>
 export type SeriesFormat = "number" | "money" | "percent";
 
 const SERIES_FORMAT: Record<SeriesMetric, SeriesFormat> = {
-  ota: "number",
+  otaCaptured: "number",
+  maskedEmail: "number",
+  maskedPhone: "number",
+  maskedAddress: "number",
+  completeProfiles: "number",
+  completenessRate: "percent",
   reached: "number",
-  email: "number",
-  phone: "number",
-  address: "number",
-  masked: "number",
-  missing: "number",
-  captureRate: "percent",
-  profiles: "number",
+  convertedGuests: "number",
+  usableEmail: "number",
+  usablePhone: "number",
+  usableAddress: "number",
   conversions: "number",
   revenue: "money",
   commission: "money",
@@ -523,20 +667,25 @@ const SERIES_FORMAT: Record<SeriesMetric, SeriesFormat> = {
 
 export const seriesFormat = (m: SeriesMetric): SeriesFormat => SERIES_FORMAT[m];
 
+const completenessRate = pct1(BASE.completeProfiles, BASE.otaGuestsCaptured);
+const bookingRate = pct1(BASE.conversions, BASE.reached);
+
 const DAILY: Record<SeriesMetric, number> = {
-  ota: BASE.otaGuests / 30,
+  otaCaptured: BASE.otaGuestsCaptured / 30,
+  maskedEmail: BASE.maskedEmails / 30,
+  maskedPhone: BASE.maskedPhones / 30,
+  maskedAddress: BASE.maskedAddresses / 30,
+  completeProfiles: BASE.completeProfiles / 30,
+  completenessRate,
   reached: BASE.reached / 30,
-  email: BASE.emails / 30,
-  phone: BASE.phones / 30,
-  address: BASE.addresses / 30,
-  masked: BASE.maskedEmails / 30,
-  missing: BASE.missingEmail / 30,
-  captureRate: captureRate(),
-  profiles: BASE.completeProfiles / 30,
+  convertedGuests: BASE.convertedGuests / 30,
+  usableEmail: BASE.usableEmails / 30,
+  usablePhone: BASE.usablePhones / 30,
+  usableAddress: BASE.usableAddresses / 30,
   conversions: BASE.conversions / 30,
   revenue: BASE.revenue / 30,
   commission: BASE.commission / 30,
-  conversionRate: conversionRate(),
+  conversionRate: bookingRate,
   repeat: BASE.repeat / 30,
 };
 
@@ -578,329 +727,25 @@ export function series(metric: SeriesMetric, period: AnalyticsPeriod): SeriesPoi
   return points;
 }
 
-/* ------------------------------ OTA engines ----------------------------- */
+/* --------------------- tab-scoped metric collections -------------------- */
 
-/**
- * Booking engines the OTA guests arrived from. Captured guest data differs a
- * lot by engine (Booking.com relays a masked address, Airbnb almost always
- * does, Expedia often passes a real one), so the Captured tab can be filtered
- * to a single engine and every number recalculates from these profiles.
- */
-export type EngineId = "all" | "booking" | "expedia" | "airbnb" | "agoda" | "hotels" | "other";
-
-type EngineProfile = {
-  value: EngineId;
-  label: string;
-  /** Share of total OTA guests. Shares of the real engines sum to 1. */
-  share: number;
-  /** Multiplier applied to captured (usable) contact data for this engine. */
-  captureBias: number;
-  /** Multiplier applied to masked relay addresses. */
-  maskedBias: number;
-  /** Multiplier applied to guests with no reachable email at all. */
-  missingBias: number;
-};
-
-const ENGINE_PROFILES: EngineProfile[] = [
-  {
-    value: "booking",
-    label: "Booking.com",
-    share: 0.38,
-    captureBias: 0.94,
-    maskedBias: 1.28,
-    missingBias: 0.86,
-  },
-  {
-    value: "expedia",
-    label: "Expedia",
-    share: 0.22,
-    captureBias: 1.12,
-    maskedBias: 0.72,
-    missingBias: 0.74,
-  },
-  {
-    value: "airbnb",
-    label: "Airbnb",
-    share: 0.14,
-    captureBias: 0.71,
-    maskedBias: 1.64,
-    missingBias: 1.42,
-  },
-  {
-    value: "agoda",
-    label: "Agoda",
-    share: 0.11,
-    captureBias: 0.88,
-    maskedBias: 1.06,
-    missingBias: 1.18,
-  },
-  {
-    value: "hotels",
-    label: "Hotels.com",
-    share: 0.09,
-    captureBias: 1.05,
-    maskedBias: 0.81,
-    missingBias: 0.9,
-  },
-  {
-    value: "other",
-    label: "Other engines",
-    share: 0.06,
-    captureBias: 0.97,
-    maskedBias: 0.95,
-    missingBias: 1.1,
-  },
-];
-
-export const OTA_ENGINES: { value: EngineId; label: string }[] = [
-  { value: "all", label: "All OTA engines" },
-  ...ENGINE_PROFILES.map((e) => ({ value: e.value, label: e.label })),
-];
-
-export const engineLabel = (id: EngineId) =>
-  OTA_ENGINES.find((e) => e.value === id)?.label ?? "All OTA engines";
-
-const ALL_ENGINES: EngineProfile = {
-  value: "all",
-  label: "All OTA engines",
-  share: 1,
-  captureBias: 1,
-  maskedBias: 1,
-  missingBias: 1,
-};
-
-const engineProfile = (id: EngineId) =>
-  id === "all" ? ALL_ENGINES : (ENGINE_PROFILES.find((e) => e.value === id) ?? ALL_ENGINES);
-
-/** Scale a base number by period AND the selected engine's mix + quality bias. */
-function byEngine(
-  n: number,
-  period: AnalyticsPeriod,
-  engine: EngineId,
-  bias: keyof EngineProfile = "captureBias",
-) {
-  const e = engineProfile(engine);
-  const factor = e.share * (typeof e[bias] === "number" ? (e[bias] as number) : 1);
-  return Math.round(scale(n, period) * factor);
-}
-
-/* ------------------- captured KPIs, engine-aware variant ----------------- */
-
-export function captureKpisFor(period: AnalyticsPeriod, engine: EngineId): Kpi[] {
-  const e = engineProfile(engine);
-  const otaGuests = Math.round(scale(BASE.otaGuests, period) * e.share);
-  const reached = Math.round(scale(BASE.reached, period) * e.share);
-  const emails = byEngine(BASE.emails, period, engine);
-  const phones = byEngine(BASE.phones, period, engine);
-  const addresses = byEngine(BASE.addresses, period, engine);
-  const masked = byEngine(BASE.maskedEmails, period, engine, "maskedBias");
-  const missing = byEngine(BASE.missingEmail, period, engine, "missingBias");
-  const captured = byEngine(BASE.capturedGuests, period, engine);
-  const profiles = byEngine(BASE.completeProfiles, period, engine);
-  const rate = otaGuests ? (captured / otaGuests) * 100 : 0;
-  const complete = captured ? (profiles / captured) * 100 : 0;
-
-  return [
-    {
-      key: "ota",
-      label: "OTA guests",
-      value: fmt(otaGuests),
-      delta: 4.1,
-      meta: "Bookings that entered the journey from an OTA.",
-      metric: "ota",
-    },
-    {
-      key: "reached",
-      label: "Guests reached",
-      value: fmt(reached),
-      delta: 6.2,
-      meta: "OTA guests we were able to message at least once.",
-      metric: "reached",
-    },
-    {
-      key: "email",
-      label: "Emails captured",
-      value: fmt(emails),
-      delta: 8.4,
-      meta: "Real, unmasked email addresses now owned by the hotel.",
-      metric: "email",
-    },
-    {
-      key: "phone",
-      label: "Phone numbers captured",
-      value: fmt(phones),
-      delta: 6.1,
-      meta: "Mobile numbers usable for SMS.",
-      metric: "phone",
-    },
-    {
-      key: "address",
-      label: "Postal addresses captured",
-      value: fmt(addresses),
-      delta: 4.2,
-      meta: "Home addresses collected during the stay.",
-      metric: "address",
-    },
-    {
-      key: "masked",
-      label: "Masked OTA emails",
-      value: fmt(masked),
-      delta: -3.4,
-      meta: "Relay addresses from the OTA — never counted as captured.",
-      metric: "masked",
-    },
-    {
-      key: "missing",
-      label: "No email at all",
-      value: fmt(missing),
-      delta: -7.9,
-      meta: "Guests with neither a real nor a masked address.",
-      metric: "missing",
-    },
-    {
-      key: "captureRate",
-      label: "Capture rate",
-      value: `${rate.toFixed(1)}%`,
-      delta: 5.3,
-      meta: "Share of OTA guests with at least one usable contact detail.",
-      metric: "captureRate",
-    },
-    {
-      key: "profiles",
-      label: "Complete profiles",
-      value: fmt(profiles),
-      delta: 9.1,
-      meta: `Email + phone both captured · ${complete.toFixed(0)}% of captured guests.`,
-      metric: "profiles",
-    },
-  ];
-}
-
-/* ------------------- data completeness, as a real table ------------------ */
-
-export type CompletenessTableRow = {
-  key: string;
-  field: string;
-  hint: string;
-  /** Usable, hotel-owned value. */
-  complete: number;
-  /** Present but unusable (masked relay) — email only. */
-  masked: number | null;
-  /** Not held in any form. */
-  missing: number;
-  total: number;
-  completePct: number;
-  maskedPct: number | null;
-  missingPct: number;
-};
-
-export function completenessTable(
-  period: AnalyticsPeriod,
-  engine: EngineId,
-): CompletenessTableRow[] {
-  const e = engineProfile(engine);
-  const total = Math.round(scale(BASE.otaGuests, period) * e.share);
-
-  const defs = [
-    {
-      key: "email",
-      field: "Email address",
-      hint: "Required to send any email campaign",
-      complete: byEngine(BASE.emails, period, engine),
-      masked: byEngine(BASE.maskedEmails, period, engine, "maskedBias"),
-    },
-    {
-      key: "phone",
-      field: "Phone number",
-      hint: "Required to send SMS",
-      complete: byEngine(BASE.phones, period, engine),
-      masked: null,
-    },
-    {
-      key: "address",
-      field: "Postal address",
-      hint: "Used for direct mail and guest profiling",
-      complete: byEngine(BASE.addresses, period, engine),
-      masked: null,
-    },
-    {
-      key: "profile",
-      field: "Complete profile",
-      hint: "Email and phone both captured",
-      complete: byEngine(BASE.completeProfiles, period, engine),
-      masked: null,
-    },
-  ];
-
-  return defs.map((d) => {
-    const masked = d.masked === null ? null : Math.min(d.masked, Math.max(0, total - d.complete));
-    const missing = Math.max(0, total - d.complete - (masked ?? 0));
-    const pct = (n: number) => (total ? Math.round((n / total) * 1000) / 10 : 0);
-    return {
-      key: d.key,
-      field: d.field,
-      hint: d.hint,
-      complete: d.complete,
-      masked,
-      missing,
-      total,
-      completePct: pct(d.complete),
-      maskedPct: masked === null ? null : pct(masked),
-      missingPct: pct(missing),
-    };
-  });
-}
-
-/* ------------------------- capture by OTA engine ------------------------- */
-
-export type EngineRow = {
-  key: EngineId;
-  engine: string;
-  share: string;
-  otaGuests: string;
-  emails: string;
-  masked: string;
-  missing: string;
-  captureRate: string;
-  captureRateValue: number;
-  profiles: string;
-};
-
-export function engineRows(period: AnalyticsPeriod): EngineRow[] {
-  return ENGINE_PROFILES.map((e) => {
-    const otaGuests = Math.round(scale(BASE.otaGuests, period) * e.share);
-    const captured = byEngine(BASE.capturedGuests, period, e.value);
-    const rate = otaGuests ? (captured / otaGuests) * 100 : 0;
-    return {
-      key: e.value,
-      engine: e.label,
-      share: `${Math.round(e.share * 100)}%`,
-      otaGuests: fmt(otaGuests),
-      emails: fmt(byEngine(BASE.emails, period, e.value)),
-      masked: fmt(byEngine(BASE.maskedEmails, period, e.value, "maskedBias")),
-      missing: fmt(byEngine(BASE.missingEmail, period, e.value, "missingBias")),
-      captureRate: `${rate.toFixed(1)}%`,
-      captureRateValue: rate,
-      profiles: fmt(byEngine(BASE.completeProfiles, period, e.value)),
-    };
-  }).sort((a, b) => b.captureRateValue - a.captureRateValue);
-}
-
-/* --------------------- tab-scoped metric collections --------------------- */
-
+/** Captured trend dropdown — masked metrics only. */
 export const CAPTURE_METRICS: SeriesMetric[] = [
-  "ota",
-  "reached",
-  "email",
-  "phone",
-  "address",
-  "masked",
-  "missing",
-  "captureRate",
-  "profiles",
+  "otaCaptured",
+  "maskedEmail",
+  "maskedPhone",
+  "maskedAddress",
+  "completeProfiles",
+  "completenessRate",
 ];
 
+/** Converted trend dropdown — reach, masked → usable, and direct business. */
 export const CONVERSION_METRICS: SeriesMetric[] = [
+  "reached",
+  "convertedGuests",
+  "usableEmail",
+  "usablePhone",
+  "usableAddress",
   "conversions",
   "revenue",
   "commission",
@@ -918,209 +763,24 @@ export function seriesFor(
   if (engine === "all" || SERIES_FORMAT[metric] === "percent") return base;
   const e = engineProfile(engine);
   const bias =
-    metric === "masked" ? e.maskedBias : metric === "missing" ? e.missingBias : e.captureBias;
-  const f = e.share * (metric === "ota" || metric === "reached" ? 1 : bias);
-  return base.map((p) => ({ ...p, current: Math.max(0, Math.round(p.current * f)) }));
+    metric === "completeProfiles"
+      ? e.completeBias
+      : metric === "otaCaptured"
+        ? 1
+        : e.maskedBias;
+  return base.map((p) => ({
+    ...p,
+    current: Math.max(0, Math.round(p.current * e.share * bias)),
+  }));
 }
 
-/* ------------------- guest profile completeness (captured) --------------- */
+/* ---------------------------- shared row types -------------------------- */
 
-/**
- * Completeness of the guest profiles received from OTA bookings.
- * A profile counts as COMPLETE when all three core fields are present —
- * masked email, masked phone, masked address — even if still masked.
- * Missing-field counts overlap: a guest can be missing more than one field.
- */
-const PROFILE = {
-  complete: 8420,
-  missingEmail: 2140,
-  missingPhone: 1680,
-  missingAddress: 2610,
-};
-
-export type ProfileCompleteness = {
-  total: number;
-  complete: number;
-  incomplete: number;
-  completePct: number;
-  missing: { key: string; label: string; count: number; pct: number }[];
-};
-
-export function profileCompleteness(
-  period: AnalyticsPeriod,
-  engine: EngineId,
-): ProfileCompleteness {
-  const e = engineProfile(engine);
-  const total = Math.round(scale(BASE.otaGuests, period) * e.share);
-  const complete = Math.min(
-    total,
-    Math.round(scale(PROFILE.complete, period) * e.share * e.captureBias),
-  );
-  const incomplete = Math.max(0, total - complete);
-  const cap = (n: number) =>
-    Math.min(incomplete, Math.round(scale(n, period) * e.share * e.missingBias));
-
-  return {
-    total,
-    complete,
-    incomplete,
-    completePct: total ? Math.round((complete / total) * 100) : 0,
-    missing: [
-      { key: "email", label: "Missing email", count: cap(PROFILE.missingEmail), pct: 0 },
-      { key: "phone", label: "Missing phone", count: cap(PROFILE.missingPhone), pct: 0 },
-      { key: "address", label: "Missing address", count: cap(PROFILE.missingAddress), pct: 0 },
-    ].map((m) => ({ ...m, pct: incomplete ? Math.round((m.count / incomplete) * 100) : 0 })),
-  };
-}
-
-/* -------------------- conversion opportunity (converted) ----------------- */
-
-/**
- * What happened to the OTA guest data that was available for conversion.
- * Campaign/guest outcomes are kept strictly separate from OTA data
- * availability: failing to convert a reachable guest is not the same as
- * losing the opportunity when the OTA data-access window expired.
- */
-const OPPORTUNITY = {
-  maskedData: 12483,
-  opportunity: 9640,
-  converted: 3820,
-  directBooking: 642,
-  /** Campaign / guest outcome — data was still usable. */
-  noUsableInfo: 2140,
-  noEngagement: 2380,
-  engagedNoBooking: 1300,
-  /** OTA data availability — opportunity was lost, not failed. */
-  windowExpired: 1980,
-  accessUnavailable: 863,
-};
-
-export type OpportunityStage = {
+export type OutcomeRow = {
   key: string;
+  group: "campaign" | "data";
   label: string;
   hint: string;
   count: number;
   pct: number;
 };
-export type OutcomeRow = { key: string; label: string; hint: string; count: number; pct: number };
-
-export type ConversionOpportunity = {
-  flow: OpportunityStage[];
-  converted: OutcomeRow;
-  notConverted: OutcomeRow;
-  campaignOutcomes: OutcomeRow[];
-  campaignTotal: number;
-  dataUnavailable: OutcomeRow;
-  dataReasons: OutcomeRow[];
-  unavailablePct: number;
-};
-
-export function conversionOpportunity(period: AnalyticsPeriod): ConversionOpportunity {
-  const s = (n: number) => scale(n, period);
-  const maskedData = s(OPPORTUNITY.maskedData);
-  const opportunity = s(OPPORTUNITY.opportunity);
-  const converted = s(OPPORTUNITY.converted);
-  const directBooking = s(OPPORTUNITY.directBooking);
-  const windowExpired = s(OPPORTUNITY.windowExpired);
-  const accessUnavailable = s(OPPORTUNITY.accessUnavailable);
-  const dataUnavailable = windowExpired + accessUnavailable;
-  const notConverted = Math.max(0, opportunity - converted);
-  const pctOfOpp = (n: number) => (opportunity ? Math.round((n / opportunity) * 1000) / 10 : 0);
-
-  const campaignOutcomes: OutcomeRow[] = [
-    {
-      key: "noUsable",
-      label: "Guest did not provide usable information",
-      hint: "Reached, but no usable email, phone or address was obtained.",
-      count: s(OPPORTUNITY.noUsableInfo),
-      pct: pctOfOpp(s(OPPORTUNITY.noUsableInfo)),
-    },
-    {
-      key: "noEngage",
-      label: "Guest did not engage",
-      hint: "Messages delivered, no interaction.",
-      count: s(OPPORTUNITY.noEngagement),
-      pct: pctOfOpp(s(OPPORTUNITY.noEngagement)),
-    },
-    {
-      key: "noBooking",
-      label: "Guest engaged but did not book direct",
-      hint: "Engaged with the campaign, no direct booking followed.",
-      count: s(OPPORTUNITY.engagedNoBooking),
-      pct: pctOfOpp(s(OPPORTUNITY.engagedNoBooking)),
-    },
-  ];
-
-  return {
-    flow: [
-      {
-        key: "masked",
-        label: "Masked OTA data",
-        hint: "Guest records received from OTA booking engines.",
-        count: maskedData,
-        pct: 100,
-      },
-      {
-        key: "opportunity",
-        label: "Conversion opportunity",
-        hint: "Records still usable inside the permitted OTA data window.",
-        count: opportunity,
-        pct: maskedData ? Math.round((opportunity / maskedData) * 1000) / 10 : 0,
-      },
-      {
-        key: "converted",
-        label: "Converted",
-        hint: "Usable guest information obtained through Directful campaigns.",
-        count: converted,
-        pct: maskedData ? Math.round((converted / maskedData) * 1000) / 10 : 0,
-      },
-      {
-        key: "direct",
-        label: "Direct booking",
-        hint: "Converted guests who went on to book direct.",
-        count: directBooking,
-        pct: maskedData ? Math.round((directBooking / maskedData) * 1000) / 10 : 0,
-      },
-    ],
-    converted: {
-      key: "converted",
-      label: "Converted",
-      hint: "Usable guest information successfully obtained.",
-      count: converted,
-      pct: pctOfOpp(converted),
-    },
-    notConverted: {
-      key: "notConverted",
-      label: "Not converted",
-      hint: "Opportunity that did not produce usable guest information.",
-      count: notConverted,
-      pct: pctOfOpp(notConverted),
-    },
-    campaignOutcomes,
-    campaignTotal: campaignOutcomes.reduce((a, b) => a + b.count, 0),
-    dataUnavailable: {
-      key: "unavailable",
-      label: "Data unavailable for conversion",
-      hint: "OTA access window expired or access was no longer available.",
-      count: dataUnavailable,
-      pct: maskedData ? Math.round((dataUnavailable / maskedData) * 1000) / 10 : 0,
-    },
-    dataReasons: [
-      {
-        key: "expired",
-        label: "Data window expired",
-        hint: "The permitted OTA data-access period had passed.",
-        count: windowExpired,
-        pct: dataUnavailable ? Math.round((windowExpired / dataUnavailable) * 100) : 0,
-      },
-      {
-        key: "revoked",
-        label: "OTA access became unavailable",
-        hint: "Access was withdrawn or restricted by the booking engine.",
-        count: accessUnavailable,
-        pct: dataUnavailable ? Math.round((accessUnavailable / dataUnavailable) * 100) : 0,
-      },
-    ],
-    unavailablePct: maskedData ? Math.round((dataUnavailable / maskedData) * 1000) / 10 : 0,
-  };
-}
